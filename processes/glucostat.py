@@ -1,19 +1,57 @@
 """
 glucostat_process.py
 
-Process-bigraph Process implementing a simple "glucostat" model:
-  - Bergman minimal-model core (G, I, X)
-  - Glucagon counter-regulation (H) driving hepatic glucose output
-  - External interventions via input port u:
-      meal_glucose_rate (mg/dL/min)
-      insulin_infusion  (uU/mL/min)
-      glucagon_infusion (arb/min)
+A simple, hackathon-friendly "glucostat" model implemented as a Process-bigraph Process.
 
-This follows the tutorial style:
-  - inputs:  y: map[float], t: float, u: map[float]
-  - outputs: y: map[float] (DELTA update), t: overwrite[float]
-  - uses scipy.integrate.odeint for integration
-  - includes a runnable Composite test under __main__
+What this file contains
+-----------------------
+1) GlucostatProcess
+   - A Process-bigraph `Process` that simulates glucose regulation dynamics using:
+       * A Bergman-style glucose/insulin core
+       * A glucagon-based counter-regulatory pathway (stimulating hepatic glucose output)
+
+2) A runnable test under:
+       if __name__ == "__main__":
+
+Model overview (high level)
+---------------------------
+We model a single "blood/plasma" compartment with four state variables:
+
+  blood_glucose_mg_dL        (G):   blood glucose concentration
+  plasma_insulin_uU_mL       (I):   plasma insulin concentration
+  insulin_action_1_per_min   (X):   delayed/remote insulin effect (Bergman "remote compartment")
+  plasma_glucagon_arb        (H):   plasma glucagon (arbitrary units; can be scaled later)
+
+External driving inputs (rates) live in a dictionary called `inputs`:
+
+  glucose_appearance_mg_dL_per_min    : glucose entering blood (e.g., meal absorption)
+  exogenous_insulin_uU_mL_per_min     : insulin infused into plasma (e.g., pump)
+  exogenous_glucagon_arb_per_min      : glucagon infused (e.g., rescue glucagon)
+
+Core equations (conceptual)
+---------------------------
+- Glucose decreases via:
+    (i) "glucose effectiveness" (insulin-independent clearance)
+    (ii) insulin action (delayed insulin effect)
+
+- Glucose increases via:
+    (i) glucose appearance from a meal
+    (ii) hepatic glucose output (stimulated by glucagon and suppressed by insulin)
+
+- Insulin and glucagon are cleared toward baselines, and can be produced by simple
+  threshold-linear endogenous secretion functions (enabled by gain parameters).
+
+Process-bigraph conventions (matching the tutorials)
+----------------------------------------------------
+- inputs() returns schemas for state read ports
+- outputs() returns schemas for state write ports
+- update() returns DELTAS for the continuous state map (delta-merge behavior)
+- time is written as overwrite[float] for a single authoritative clock
+
+Requirements
+------------
+- SciPy (for odeint) is used in this version, following the tutorial_2 pattern.
+
 """
 
 import sys
@@ -35,177 +73,322 @@ except Exception as e:
 
 
 def rebuild_core():
-    """Tutorial pattern: rebuild core from __main__ symbol table."""
+    """Tutorial pattern: rebuild a Core that knows how to resolve local class addresses."""
     top = dict(inspect.getmembers(sys.modules["__main__"]))
     return allocate_core(top=top)
 
 
 class GlucostatProcess(Process):
     """
-    Glucostat process in the same style as tutorial_2's ODEIntProcess.
+    GlucostatProcess (Process-bigraph Process)
 
-    State variables in y:
-      - G : blood glucose (mg/dL)
-      - I : plasma insulin (uU/mL)
-      - X : insulin action (1/min)   (remote compartment)
-      - H : glucagon (arb)
+    This process simulates short-timescale glucose regulation using a compact ODE model.
 
-    Inputs in u (rates):
-      - meal_glucose_rate   (mg/dL/min)
-      - insulin_infusion    (uU/mL/min)
-      - glucagon_infusion   (arb/min)
+    State (stored in the `state` map)
+    --------------------------------
+    state is a map[float] with the following keys:
+
+      blood_glucose_mg_dL
+          Blood glucose concentration (mg/dL).
+
+      plasma_insulin_uU_mL
+          Plasma insulin concentration (micro-units per mL).
+
+      insulin_action_1_per_min
+          "Remote" insulin action state (1/min). This represents delayed insulin effect
+          on glucose uptake/clearance (Bergman minimal-model idea).
+
+      plasma_glucagon_arb
+          Plasma glucagon concentration in arbitrary units (can be scaled later).
+
+    Inputs (stored in the `inputs` map)
+    -----------------------------------
+    inputs is a map[float] with the following keys:
+
+      glucose_appearance_mg_dL_per_min
+          Net glucose appearance into the blood compartment (mg/dL/min).
+          Think: meal absorption already mapped into blood concentration units.
+
+      exogenous_insulin_uU_mL_per_min
+          Exogenous insulin infusion rate into plasma (uU/mL/min).
+
+      exogenous_glucagon_arb_per_min
+          Exogenous glucagon infusion rate (arb/min).
+
+    Outputs
+    -------
+    - state: map[float]  (DELTA update: dy over the interval)
+    - time_min: overwrite[float]  (absolute time, in minutes)
+
+    Notes
+    -----
+    - Endogenous insulin/glucagon secretion are simple threshold-linear placeholders.
+      Set secretion gains to 0.0 to disable them.
+    - Hepatic glucose output is driven by glucagon and suppressed by insulin.
+    - The intent is clarity + extensibility, not perfect physiology.
     """
 
     config_schema = {
-        # Integration
-        "dt": {"_type": "float", "_default": 0.1},
+        # --- Integration settings ---
+        "internal_dt_min": {"_type": "float", "_default": 0.1},
         "odeint_kwargs": {"_type": "node", "_default": {}},
 
-        # Baselines
-        "G_basal": {"_type": "float", "_default": 90.0},
-        "I_basal": {"_type": "float", "_default": 10.0},
-        "H_basal": {"_type": "float", "_default": 1.0},
+        # --- Baseline "set points" ---
+        "baseline_glucose_mg_dL": {"_type": "float", "_default": 90.0},
+        "baseline_insulin_uU_mL": {"_type": "float", "_default": 10.0},
+        "baseline_glucagon_arb": {"_type": "float", "_default": 1.0},
 
-        # Bergman-ish parameters
-        "p1": {"_type": "float", "_default": 0.02},   # 1/min glucose effectiveness
-        "p2": {"_type": "float", "_default": 0.03},   # 1/min insulin action decay
-        "p3": {"_type": "float", "_default": 1e-4},   # 1/(min*uU/mL) action gain
+        # --- Bergman-style glucose/insulin core parameters ---
+        "glucose_effectiveness_1_per_min": {"_type": "float", "_default": 0.02},  # p1
+        "insulin_action_decay_1_per_min": {"_type": "float", "_default": 0.03},   # p2
+        "insulin_to_action_gain_1_per_min_per_uU_mL": {"_type": "float", "_default": 1e-4},  # p3
 
-        # Insulin kinetics + simple endogenous secretion
-        "kI": {"_type": "float", "_default": 0.15},   # 1/min clearance toward basal
-        "insulin_secretion_gain": {"_type": "float", "_default": 0.0},
-        "insulin_secretion_threshold": {"_type": "float", "_default": 90.0},
+        # --- Insulin kinetics + simple endogenous secretion ---
+        "insulin_clearance_1_per_min": {"_type": "float", "_default": 0.15},
+        "insulin_secretion_gain_uU_mL_per_min_per_mg_dL": {"_type": "float", "_default": 0.0},
+        "insulin_secretion_threshold_mg_dL": {"_type": "float", "_default": 90.0},
 
-        # Glucagon kinetics + simple endogenous secretion
-        "kH": {"_type": "float", "_default": 0.10},   # 1/min clearance toward basal
-        "glucagon_secretion_gain": {"_type": "float", "_default": 0.05},
-        "glucagon_secretion_threshold": {"_type": "float", "_default": 80.0},
+        # --- Glucagon kinetics + simple endogenous secretion ---
+        "glucagon_clearance_1_per_min": {"_type": "float", "_default": 0.10},
+        "glucagon_secretion_gain_arb_per_min_per_mg_dL": {"_type": "float", "_default": 0.05},
+        "glucagon_secretion_threshold_mg_dL": {"_type": "float", "_default": 80.0},
 
-        # Hepatic glucose output (H-driven, I-suppressed)
-        "hepatic_output_basal": {"_type": "float", "_default": 0.5},   # mg/dL/min
-        "hepatic_output_gain": {"_type": "float", "_default": 1.0},    # mg/dL/min per (H-H_basal)
-        "hepatic_output_insulin_suppression": {"_type": "float", "_default": 0.02},  # per uU/mL above basal
+        # --- Hepatic glucose output (H-driven, I-suppressed) ---
+        "hepatic_glucose_output_basal_mg_dL_per_min": {"_type": "float", "_default": 0.5},
+        "hepatic_glucose_output_gain_mg_dL_per_min_per_arb": {"_type": "float", "_default": 1.0},
+        "hepatic_output_insulin_suppression_per_uU_mL": {"_type": "float", "_default": 0.02},
 
-        # Safety
-        "clamp_nonnegative": {"_type": "boolean", "_default": True},
+        # --- Safety / housekeeping ---
+        "clamp_state_nonnegative": {"_type": "boolean", "_default": True},
 
-        # Deterministic ordering
-        "state_keys": {"_type": "list[string]", "_default": ["G", "I", "X", "H"]},
+        # Deterministic ordering (vectorize for odeint)
+        "state_keys": {
+            "_type": "list[string]",
+            "_default": [
+                "blood_glucose_mg_dL",
+                "plasma_insulin_uU_mL",
+                "insulin_action_1_per_min",
+                "plasma_glucagon_arb",
+            ],
+        },
     }
 
     def initialize(self, config=None):
-        # Basic validation (tutorial style)
-        keys = self.config.get("state_keys", ["G", "I", "X", "H"])
+        # Basic validation
+        keys = self.config.get("state_keys", [])
         if not isinstance(keys, (list, tuple)) or len(keys) == 0:
-            raise ValueError("config['state_keys'] must be a non-empty list")
+            raise ValueError("config['state_keys'] must be a non-empty list of strings")
         return self.config
 
+    # -----------------------------
+    # Process ports: schemas
+    # -----------------------------
     def inputs(self):
         return {
-            "y": "map[float]",
-            "t": "float",
-            "u": "map[float]",
+            "state": "map[float]",
+            "time_min": "float",
+            "inputs": "map[float]",
         }
 
     def outputs(self):
         return {
-            "y": "map[float]",          # DELTA
-            "t": "overwrite[float]",    # clock overwrite
+            "state": "map[float]",           # DELTA update (tutorial style)
+            "time_min": "overwrite[float]",  # authoritative clock update
         }
 
     # -----------------------------
-    # RHS
+    # Model RHS (dy/dt)
     # -----------------------------
-    def _rhs_dict(self, y, t, u):
+    def _rhs_dict(self, state_map, t_min, inputs_map):
+        """
+        Compute time-derivatives of the model state.
+
+        Parameters
+        ----------
+        state_map : dict
+            Current state values (descriptive keys).
+        t_min : float
+            Current time in minutes (unused here, but included for generality).
+        inputs_map : dict
+            External driving inputs (rates).
+
+        Returns
+        -------
+        dict
+            Derivatives d(state)/dt keyed by the same state keys.
+        """
         cfg = self.config
 
-        G = float(y.get("G", cfg["G_basal"]))
-        I = float(y.get("I", cfg["I_basal"]))
-        X = float(y.get("X", 0.0))
-        H = float(y.get("H", cfg["H_basal"]))
+        # Unpack state (with sensible defaults)
+        glucose = float(state_map.get("blood_glucose_mg_dL", cfg["baseline_glucose_mg_dL"]))
+        insulin = float(state_map.get("plasma_insulin_uU_mL", cfg["baseline_insulin_uU_mL"]))
+        insulin_action = float(state_map.get("insulin_action_1_per_min", 0.0))
+        glucagon = float(state_map.get("plasma_glucagon_arb", cfg["baseline_glucagon_arb"]))
 
-        meal = float(u.get("meal_glucose_rate", 0.0))
-        u_ins = float(u.get("insulin_infusion", 0.0))
-        u_glu = float(u.get("glucagon_infusion", 0.0))
+        # Unpack external inputs (rates)
+        glucose_appearance = float(inputs_map.get("glucose_appearance_mg_dL_per_min", 0.0))
+        exo_insulin = float(inputs_map.get("exogenous_insulin_uU_mL_per_min", 0.0))
+        exo_glucagon = float(inputs_map.get("exogenous_glucagon_arb_per_min", 0.0))
 
-        # Simple endogenous secretion (threshold-linear placeholders)
-        S_I = cfg["insulin_secretion_gain"] * max(0.0, G - cfg["insulin_secretion_threshold"])
-        S_H = cfg["glucagon_secretion_gain"] * max(0.0, cfg["glucagon_secretion_threshold"] - G)
-
-        # Hepatic output: basal + glucagon drive, suppressed by insulin above basal
-        insulin_supp = max(
-            0.0,
-            1.0 - cfg["hepatic_output_insulin_suppression"] * max(0.0, I - cfg["I_basal"])
+        # --- Endogenous secretion (threshold-linear placeholders) ---
+        # Insulin secretion activates above a glucose threshold.
+        insulin_secretion = cfg["insulin_secretion_gain_uU_mL_per_min_per_mg_dL"] * max(
+            0.0, glucose - cfg["insulin_secretion_threshold_mg_dL"]
         )
-        hepatic_output = (cfg["hepatic_output_basal"]
-                          + cfg["hepatic_output_gain"] * max(0.0, H - cfg["H_basal"])) * insulin_supp
 
-        # Bergman-like dynamics
-        dX = -cfg["p2"] * X + cfg["p3"] * (I - cfg["I_basal"])
-        dG = -(cfg["p1"] + X) * (G - cfg["G_basal"]) + meal + hepatic_output
-        dI = -cfg["kI"] * (I - cfg["I_basal"]) + S_I + u_ins
-        dH = -cfg["kH"] * (H - cfg["H_basal"]) + S_H + u_glu
+        # Glucagon secretion activates below a glucose threshold.
+        glucagon_secretion = cfg["glucagon_secretion_gain_arb_per_min_per_mg_dL"] * max(
+            0.0, cfg["glucagon_secretion_threshold_mg_dL"] - glucose
+        )
 
-        return {"G": dG, "I": dI, "X": dX, "H": dH}
+        # --- Hepatic glucose output ---
+        # Driven by glucagon above baseline, suppressed by insulin above baseline.
+        insulin_suppression_factor = max(
+            0.0,
+            1.0 - cfg["hepatic_output_insulin_suppression_per_uU_mL"] * max(
+                0.0, insulin - cfg["baseline_insulin_uU_mL"]
+            ),
+        )
 
-    def _dict_to_vec(self, y_dict, keys):
-        return np.array([float(y_dict.get(k, 0.0)) for k in keys], dtype=float)
+        hepatic_output = (
+            cfg["hepatic_glucose_output_basal_mg_dL_per_min"]
+            + cfg["hepatic_glucose_output_gain_mg_dL_per_min_per_arb"]
+            * max(0.0, glucagon - cfg["baseline_glucagon_arb"])
+        ) * insulin_suppression_factor
 
-    def _vec_to_dict(self, y_vec, keys):
-        return {k: float(y_vec[i]) for i, k in enumerate(keys)}
+        # --- Bergman-like core dynamics ---
+        # Insulin action compartment: delayed insulin effect
+        d_insulin_action = (
+            -cfg["insulin_action_decay_1_per_min"] * insulin_action
+            + cfg["insulin_to_action_gain_1_per_min_per_uU_mL"] * (insulin - cfg["baseline_insulin_uU_mL"])
+        )
 
+        # Glucose dynamics: clearance + appearance + hepatic output
+        d_glucose = (
+            -(cfg["glucose_effectiveness_1_per_min"] + insulin_action)
+            * (glucose - cfg["baseline_glucose_mg_dL"])
+            + glucose_appearance
+            + hepatic_output
+        )
+
+        # Insulin dynamics: clearance toward baseline + secretion + infusion
+        d_insulin = (
+            -cfg["insulin_clearance_1_per_min"] * (insulin - cfg["baseline_insulin_uU_mL"])
+            + insulin_secretion
+            + exo_insulin
+        )
+
+        # Glucagon dynamics: clearance toward baseline + secretion + infusion
+        d_glucagon = (
+            -cfg["glucagon_clearance_1_per_min"] * (glucagon - cfg["baseline_glucagon_arb"])
+            + glucagon_secretion
+            + exo_glucagon
+        )
+
+        return {
+            "blood_glucose_mg_dL": d_glucose,
+            "plasma_insulin_uU_mL": d_insulin,
+            "insulin_action_1_per_min": d_insulin_action,
+            "plasma_glucagon_arb": d_glucagon,
+        }
+
+    # -----------------------------
+    # Helpers: dict <-> vector
+    # -----------------------------
+    def _dict_to_vec(self, d, keys):
+        return np.array([float(d.get(k, 0.0)) for k in keys], dtype=float)
+
+    def _vec_to_dict(self, v, keys):
+        return {k: float(v[i]) for i, k in enumerate(keys)}
+
+    # -----------------------------
+    # Update step (odeint integration over interval)
+    # -----------------------------
     def update(self, state, interval):
+        """
+        Advance the model state by `interval` minutes.
+
+        The process returns a DELTA update for the `state` map, and overwrites `time_min`.
+
+        Parameters
+        ----------
+        state : dict
+            Current process input state, containing:
+              state["state"]   -> map of state variables
+              state["time_min"] -> current time in minutes
+              state["inputs"]  -> map of external input rates
+        interval : float
+            Time step in minutes provided by the Composite scheduler.
+
+        Returns
+        -------
+        dict
+            {"state": delta_state_map, "time_min": new_time}
+        """
         cfg = self.config
-        keys = list(cfg.get("state_keys", ["G", "I", "X", "H"]))
+        keys = list(cfg["state_keys"])
 
-        y0 = dict(state.get("y", {}))
-        t0 = float(state.get("t", 0.0))
-        u = dict(state.get("u", {}))
+        # Current values
+        state_map_0 = dict(state.get("state", {}))
+        time_0 = float(state.get("time_min", 0.0))
+        inputs_map = dict(state.get("inputs", {}))
 
-        # defaults if missing
-        y0.setdefault("G", cfg["G_basal"])
-        y0.setdefault("I", cfg["I_basal"])
-        y0.setdefault("X", 0.0)
-        y0.setdefault("H", cfg["H_basal"])
+        # Fill missing state with defaults
+        state_map_0.setdefault("blood_glucose_mg_dL", cfg["baseline_glucose_mg_dL"])
+        state_map_0.setdefault("plasma_insulin_uU_mL", cfg["baseline_insulin_uU_mL"])
+        state_map_0.setdefault("insulin_action_1_per_min", 0.0)
+        state_map_0.setdefault("plasma_glucagon_arb", cfg["baseline_glucagon_arb"])
 
-        t1 = t0 + float(interval)
+        # Integrate from time_0 to time_1 using odeint
+        time_1 = time_0 + float(interval)
+        internal_dt = float(cfg["internal_dt_min"])
+        n_steps = max(2, int(np.ceil((time_1 - time_0) / internal_dt)) + 1)
+        ts = np.linspace(time_0, time_1, n_steps)
 
-        dt = float(cfg.get("dt", 0.1))
-        odeint_kwargs = dict(cfg.get("odeint_kwargs", {}))
+        y0 = self._dict_to_vec(state_map_0, keys)
 
-        n_steps = max(2, int(np.ceil((t1 - t0) / dt)) + 1)
-        ts = np.linspace(t0, t1, n_steps)
-
-        y0_vec = self._dict_to_vec(y0, keys)
-
-        def f(y_vec, t):
+        def f(y_vec, t_min):
             y_dict = self._vec_to_dict(y_vec, keys)
-            dy = self._rhs_dict(y_dict, t, u)
+            dy = self._rhs_dict(y_dict, t_min, inputs_map)
             return np.array([float(dy.get(k, 0.0)) for k in keys], dtype=float)
 
-        traj = odeint(lambda yv, tt: f(yv, tt), y0_vec, ts, **odeint_kwargs)
-        y1_vec = traj[-1, :]
+        odeint_kwargs = dict(cfg.get("odeint_kwargs", {}))
+        traj = odeint(lambda yv, tt: f(yv, tt), y0, ts, **odeint_kwargs)
+        y1 = traj[-1, :]
 
-        dy_vec = y1_vec - y0_vec
-        dy = self._vec_to_dict(dy_vec, keys)
+        # DELTA update (tutorial style)
+        delta_vec = y1 - y0
+        delta_map = self._vec_to_dict(delta_vec, keys)
 
-        if cfg.get("clamp_nonnegative", True):
-            # prevent pushing state below zero via delta
-            for i, k in enumerate(keys):
-                if float(y0.get(k, 0.0)) + float(dy[k]) < 0.0:
-                    dy[k] = -float(y0.get(k, 0.0))
+        # Optional nonnegativity clamp by limiting the delta
+        if cfg.get("clamp_state_nonnegative", True):
+            for k in keys:
+                if float(state_map_0.get(k, 0.0)) + float(delta_map[k]) < 0.0:
+                    delta_map[k] = -float(state_map_0.get(k, 0.0))
 
-        return {"y": dy, "t": float(t1)}
+        return {"state": delta_map, "time_min": float(time_1)}
 
 
-def glucostat_initial_state(G=90.0, I=10.0, X=0.0, H=1.0, t=0.0):
+def glucostat_initial_state(
+    blood_glucose_mg_dL=90.0,
+    plasma_insulin_uU_mL=10.0,
+    insulin_action_1_per_min=0.0,
+    plasma_glucagon_arb=1.0,
+    time_min=0.0,
+):
+    """Convenience helper to build the expected state tree for this process."""
     return {
-        "t": float(t),
-        "y": {"G": float(G), "I": float(I), "X": float(X), "H": float(H)},
-        "u": {
-            "meal_glucose_rate": 0.0,
-            "insulin_infusion": 0.0,
-            "glucagon_infusion": 0.0,
+        "time_min": float(time_min),
+        "state": {
+            "blood_glucose_mg_dL": float(blood_glucose_mg_dL),
+            "plasma_insulin_uU_mL": float(plasma_insulin_uU_mL),
+            "insulin_action_1_per_min": float(insulin_action_1_per_min),
+            "plasma_glucagon_arb": float(plasma_glucagon_arb),
+        },
+        "inputs": {
+            "glucose_appearance_mg_dL_per_min": 0.0,
+            "exogenous_insulin_uU_mL_per_min": 0.0,
+            "exogenous_glucagon_arb_per_min": 0.0,
         },
     }
 
@@ -217,51 +400,58 @@ if __name__ == "__main__":
     core = rebuild_core()
     print("✅ Core ready")
 
-    GLUCO_ADDR = f"local:!{GlucostatProcess.__module__}.GlucostatProcess"
-    print("Using address:", GLUCO_ADDR)
+    PROC_ADDR = f"local:!{GlucostatProcess.__module__}.GlucostatProcess"
+    print("Using process address:", PROC_ADDR)
 
-    # Build a simple meal pulse: we'll keep u constant for each process interval.
-    # For a quick test, we just set meal_glucose_rate to a positive value for the whole run.
-    init = glucostat_initial_state(G=90, I=10, X=0, H=1, t=0)
-    init["u"]["meal_glucose_rate"] = 2.0     # mg/dL/min glucose appearance (toy)
-    init["u"]["insulin_infusion"] = 0.0
-    init["u"]["glucagon_infusion"] = 0.0
+    # Initial conditions
+    init = glucostat_initial_state(
+        blood_glucose_mg_dL=90.0,
+        plasma_insulin_uU_mL=10.0,
+        insulin_action_1_per_min=0.0,
+        plasma_glucagon_arb=1.0,
+        time_min=0.0,
+    )
+
+    # Turn on a simple endogenous insulin secretion rule so glucose responds to a "meal"
+    process_config = {
+        "internal_dt_min": 0.05,
+        "odeint_kwargs": {"rtol": 1e-8, "atol": 1e-10},
+        "insulin_secretion_gain_uU_mL_per_min_per_mg_dL": 0.05,
+    }
+
+    # Provide a constant "meal-like" glucose appearance drive for the whole simulation
+    init["inputs"]["glucose_appearance_mg_dL_per_min"] = 2.0  # toy value
 
     sim = Composite(
         {
             "state": {
-                # shared state
-                "t": init["t"],
-                "y": init["y"],
-                "u": init["u"],
+                # Shared state
+                "time_min": init["time_min"],
+                "state": init["state"],
+                "inputs": init["inputs"],
 
-                # process node
+                # Process node
                 "glucostat": {
                     "_type": "process",
-                    "address": GLUCO_ADDR,
-                    "config": {
-                        "dt": 0.05,
-                        "odeint_kwargs": {"rtol": 1e-8, "atol": 1e-10},
-                        # keep default parameters, but you can tweak here
-                        "insulin_secretion_gain": 0.05,  # turn on simple endogenous insulin secretion
-                    },
-                    "interval": 0.2,  # minutes per process update
-                    "inputs": {"t": ["t"], "y": ["y"], "u": ["u"]},
-                    "outputs": {"t": ["t"], "y": ["y"]},
+                    "address": PROC_ADDR,
+                    "config": process_config,
+                    "interval": 0.2,  # minutes per update
+                    "inputs": {"time_min": ["time_min"], "state": ["state"], "inputs": ["inputs"]},
+                    "outputs": {"time_min": ["time_min"], "state": ["state"]},
                 },
 
-                # emitter time series
+                # Emitter to record time series
                 "emitter": emitter_from_wires(
                     {
-                        "time": ["global_time"],
-                        "t": ["t"],
-                        "G": ["y", "G"],
-                        "I": ["y", "I"],
-                        "X": ["y", "X"],
-                        "H": ["y", "H"],
-                        "meal": ["u", "meal_glucose_rate"],
-                        "u_ins": ["u", "insulin_infusion"],
-                        "u_glu": ["u", "glucagon_infusion"],
+                        "global_time": ["global_time"],
+                        "time_min": ["time_min"],
+                        "blood_glucose_mg_dL": ["state", "blood_glucose_mg_dL"],
+                        "plasma_insulin_uU_mL": ["state", "plasma_insulin_uU_mL"],
+                        "insulin_action_1_per_min": ["state", "insulin_action_1_per_min"],
+                        "plasma_glucagon_arb": ["state", "plasma_glucagon_arb"],
+                        "glucose_appearance_mg_dL_per_min": ["inputs", "glucose_appearance_mg_dL_per_min"],
+                        "exogenous_insulin_uU_mL_per_min": ["inputs", "exogenous_insulin_uU_mL_per_min"],
+                        "exogenous_glucagon_arb_per_min": ["inputs", "exogenous_glucagon_arb_per_min"],
                     }
                 ),
             }
@@ -269,7 +459,7 @@ if __name__ == "__main__":
         core=core,
     )
 
-    # Run for 10 minutes of composite time
+    # Run for 10 minutes
     sim.run(10.0)
 
     records = sim.state["emitter"]["instance"].query()
@@ -277,9 +467,14 @@ if __name__ == "__main__":
     print("first record:", records[0])
     print("last record:", records[-1])
 
-    # Basic sanity assertions
+    # Basic sanity checks
     last = records[-1]
-    for k in ("G", "I", "X", "H"):
+    for k in (
+        "blood_glucose_mg_dL",
+        "plasma_insulin_uU_mL",
+        "insulin_action_1_per_min",
+        "plasma_glucagon_arb",
+    ):
         val = float(last[k])
         assert np.isfinite(val), f"{k} is not finite"
         assert val >= 0.0, f"{k} went negative"
